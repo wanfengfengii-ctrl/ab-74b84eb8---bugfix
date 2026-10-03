@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>藻类细胞分裂谱系复原</title>
+  <link rel="stylesheet" href="./css/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>藻类细胞分裂谱系复原</h1>
+    <p class="subtitle">连续荧光帧联合选点 · 保持 / 分裂 / 漏检 · 浏览器内求解，不上传数据</p>
+  </header>
+
+  <main class="layout">
+    <section class="panel" id="editor-panel">
+      <div class="panel-head">
+        <h2>帧与斑点录入</h2>
+        <div class="panel-actions">
+          <button type="button" id="btn-add-frame" class="btn ghost">＋ 添加帧</button>
+          <button type="button" id="btn-sample" class="btn ghost">载入示例</button>
+        </div>
+      </div>
+      <div id="frames"></div>
+
+      <div class="params">
+        <label>
+          起始斑点（第 1 帧）
+          <select id="start-select"></select>
+        </label>
+        <label>
+          相邻帧最大位移（像素）
+          <input type="number" id="max-dist" min="0" step="1" />
+        </label>
+        <label>
+          允许漏检帧数（漏检段总额度，每段跨一帧）
+          <input type="number" id="max-skip" min="0" step="1" />
+        </label>
+        <label>
+          终帧应存活细胞数
+          <input type="number" id="target" min="1" step="1" />
+        </label>
+      </div>
+
+      <div class="actions">
+        <button type="button" id="btn-solve" class="btn primary">复　原</button>
+        <span id="stale-hint" class="hint hidden">输入已修改，旧谱系已作废，请重新点击「复原」。</span>
+      </div>
+      <div id="form-errors" class="form-errors hidden"></div>
+    </section>
+
+    <section class="panel" id="result-panel">
+      <div class="panel-head"><h2>复原结果</h2></div>
+      <div id="result-empty" class="placeholder">填写 4 至 7 帧后点击「复原」，此处显示采用斑点、母女连线、漏检段与逐段位移。</div>
+      <div id="result-infeasible" class="result-banner infeasible hidden"></div>
+      <div id="result-ok" class="hidden">
+        <div class="stats" id="stats"></div>
+        <div class="legend">
+          <span><i class="sw solid"></i>母女连线</span>
+          <span><i class="sw dashed"></i>漏检段（跨一帧）</span>
+          <span><i class="dot used"></i>采用斑点</span>
+          <span><i class="dot unused"></i>未采用</span>
+          <span><i class="ring"></i>起始斑点</span>
+        </div>
+        <div id="chart"></div>
+        <h3>逐段连接与位移</h3>
+        <div class="table-wrap">
+          <table id="edges-table">
+            <thead>
+              <tr><th>#</th><th>母本</th><th>女儿</th><th>关系</th><th>跨越</th><th>位移</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <h3>各帧采用斑点</h3>
+        <div id="used-list" class="used-list"></div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>

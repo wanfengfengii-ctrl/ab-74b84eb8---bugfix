@@ -1,0 +1,47 @@
+services:
+  web:
+    build: .
+    image: algal-lineage-web
+    container_name: algal-lineage-web
+    environment:
+      # 容器内监听端口（健康检查同样读取此变量）
+      WEB_PORT: ${WEB_PORT:-8080}
+      WEB_HOST: 0.0.0.0
+    ports:
+      # 宿主机访问端口由 WEB_PORT 配置，默认 8080
+      - "${WEB_PORT:-8080}:${WEB_PORT:-8080}"
+    expose:
+      - "${WEB_PORT:-8080}"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:'+(process.env.WEB_PORT||8080)+'/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  # 一次性校验服务：健康检查通过后自行执行单元测试、构建与谱系烟测，
+  # 以容器退出码报告结果（0 全部通过，非 0 存在失败）。
+  # 让 Compose 以其退出码为准：
+  #   docker compose up --abort-on-container-exit --exit-code-from verify
+  verify:
+    build: .
+    image: algal-lineage-web
+    container_name: algal-lineage-verify
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      BASE_URL: "http://web:${WEB_PORT:-8080}"
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "==> [1/3] 单元测试（求解器约束、裁决、对拍）"
+        node --test test/*.test.mjs
+        echo "==> [2/3] 构建（语法检查与资源完整性）"
+        node scripts/build.mjs
+        echo "==> [3/3] 谱系烟测（健康检查、静态资源、分裂+漏检）"
+        node scripts/smoke.mjs
+        echo "==> verify 全部通过"

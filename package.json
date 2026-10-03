@@ -1,0 +1,16 @@
+{
+  "name": "algal-lineage",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "藻类细胞分裂谱系复原（浏览器内联合选点与连接）",
+  "scripts": {
+    "start": "node server.cjs",
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
