@@ -254,6 +254,32 @@ test('修改帧内容后重新求解得到不同谱系（不保留旧结果由�
   assert.ok(s2.used[1].includes('b2'));
 });
 
+test('满规模全邻接（7 帧 × 8 斑点）精确求解：即时返回且采用 1/2/4/8/8/8/8', () => {
+  // 全部斑点同坐标、亮度均为 1：所有候选连接可达、所有最优解完全并列，
+  // 是状态空间最大的退化输入；必须在可交互时间内精确返回。
+  const frames = Array.from({ length: 7 }, (_, t) =>
+    Array.from({ length: 8 }, (_, i) => ({ id: `s${t}_${i}`, x: 0, y: 0, b: 1 })));
+  const input = { frames, startId: 's0_0', maxDist: 1, maxSkip: 5, target: 8 };
+  const { spec } = (() => {
+    const r = normalizeSpec(input);
+    assert.deepEqual(r.errors, []);
+    return r;
+  })();
+  const t0 = Date.now();
+  const raw = solveLineage(spec);
+  const ms = Date.now() - t0;
+  assert.ok(ms < 5000, `满规模求解应在 5s 内返回，实际 ${ms}ms`);
+  const sol = presentSolution(spec, raw);
+  assertValidLineage(spec, sol, input);
+  assert.deepEqual(sol.counts, [1, 2, 4, 8, 8, 8, 8]);
+  assert.equal(sol.totalBrightness, 39);
+  assert.equal(sol.skips, 0);
+  assert.equal(sol.divisions, 7);
+  assert.deepEqual(sol.used[1], ['s1_0', 's1_1']);
+  assert.deepEqual(sol.used[2], ['s2_0', 's2_1', 's2_2', 's2_3']);
+  assert.deepEqual(sol.used[6], frames[6].map((s) => s.id));
+});
+
 test('输入校验：帧数、斑点数、重复编号、参数范围', () => {
   const bad = { frames: base4().frames.slice(0, 3), startId: 'a', maxDist: 1, maxSkip: 0, target: 1 };
   assert.equal(normalizeSpec(bad).errors.length > 0, true);

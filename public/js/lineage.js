@@ -9,11 +9,29 @@
 //  - 裁决顺序：总亮度最高 → 漏检段最少 → 输入顺序（逐帧采用斑点局部序号，
 //    再逐斑点母本全局序号）字典序稳定裁决。
 //
-// 位掩码动态规划：帧内斑点以位掩码表示；边界转移在「已占用女儿掩码 +
-// 新开漏检母本掩码」上做内层 DP，同一 (女儿集合, 漏检集合) 只保留字典序最小
-// 的母本配对，不展开母亲排列；状态 (帧, 存活掩码, 漏检掩码, 剩余额度) 备忘。
+// 三阶段精确求解（不缩小支持范围、不近似、不改裁决语义）：
+//  阶段一 边界联合转移对 transitions(t, live, gaps)：存活母本（帧 t）与待
+//    补获漏检母本（帧 t-1）在帧 t+1 上联合安排女儿，内层 DP 枚举
+//    （女儿掩码, 新开漏检掩码）全部可行对。结果只依赖 (t, live, gaps)，
+//    以紧凑 Uint32Array 缓存（每对一个整数，不存母本向量）。
+//  阶段二 取值 DP valueDP(t, live, gaps, left)：严格按
+//    (t, live, gaps, 剩余漏检额度) 备忘，每状态只存
+//    （最高亮度, 最少漏检）两个小整数；配合乐观亮度上界与漏检前缀严格
+//    剪枝（相等才可能并列，绝不误杀）。
+//  阶段三 精确残量可行性 feas(t,…,B,S)：后缀能否恰好取得亮度 B、漏检 S，
+//    备忘为布尔；随后沿最优路径在每个边界只对「该状态」的转移对按输入
+//    顺序排序，取第一个残量可行的对——逐帧贪心取字典序最小即全局字典序
+//    最小。被选中对的母本配对由受限于该 (女儿掩码, 漏检掩码) 的小型 DP
+//    按需求出（同样只保留字典序最小配对）。
 
 'use strict';
+
+// 全局斑点总数 ≤ 7×8 = 56，母本序号 0..55 用 6 bit 表示；
+// 未分配用 0，已分配母本 g 编码为 g+1。
+const MOM_BITS = 6;
+const MOM_MASK = (1 << MOM_BITS) - 1;
+const momGet = (packed, j) => (((packed / 2 ** (MOM_BITS * j)) | 0) & MOM_MASK) - 1;
+const momSet = (packed, j, g) => packed + (g + 1) * 2 ** (MOM_BITS * j);
 
 /**
  * 校验并规范化输入。
@@ -98,7 +116,7 @@ export function normalizeSpec(raw) {
   };
 }
 
-function compareTuple(a, b) {
+function compareList(a, b) {
   const n = Math.min(a.length, b.length);
   for (let i = 0; i < n; i++) {
     if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
@@ -106,16 +124,18 @@ function compareTuple(a, b) {
   return a.length - b.length;
 }
 
-// 比较两个裁决签名：逐帧比较（采用斑点局部序号元组，再母本全局序号元组）。
-function betterSignature(a, b) {
-  const n = Math.min(a.length, b.length);
-  for (let k = 0; k < n; k++) {
-    const c = compareTuple(a[k].used, b[k].used);
-    if (c !== 0) return c < 0;
-    const cm = compareTuple(a[k].mothers, b[k].mothers);
-    if (cm !== 0) return cm < 0;
+// 8 位以内掩码的公共查表
+const PC = new Uint8Array(256); // 置位数
+const BITS = new Array(256); // 置位序号列表
+const CTZ = new Uint8Array(256); // 最低置位序号
+for (let m = 0; m < 256; m++) {
+  const ls = [];
+  for (let i = 0, v = m; v; i++, v >>>= 1) {
+    if (v & 1) ls.push(i);
   }
-  return false;
+  BITS[m] = ls;
+  PC[m] = ls.length;
+  CTZ[m] = ls.length ? ls[0] : 0;
 }
 
 /**
@@ -143,17 +163,6 @@ export function solveLineage(spec) {
     return dx * dx + dy * dy;
   };
 
-  const popcnt = (m) => {
-    let c = 0;
-    while (m) { m &= m - 1; c++; }
-    return c;
-  };
-  const bits = (m) => {
-    const out = [];
-    for (let i = 0; m; i++, m >>>= 1) if (m & 1) out.push(i);
-    return out;
-  };
-
   // 邻接位掩码：near1[t][i] 为帧 t 斑点 i 在帧 t+1 内可达的女儿掩码；
   // near2[t][i] 为跨一帧漏检后在帧 t+2 内可达的女儿掩码。
   const D2 = maxDist * maxDist;
@@ -175,12 +184,12 @@ export function solveLineage(spec) {
     }
   }
 
-  // 各帧「掩码 → 亮度和」预计算
+  // 各帧「掩码 → 亮度和」预计算（亮度为用户整数，用 Float64 保证大整数精确）
   const maskBright = frames.map((fr) => {
-    const arr = new Array(1 << fr.length).fill(0);
+    const arr = new Float64Array(1 << fr.length);
     for (let m = 1; m < arr.length; m++) {
       const lsb = m & -m;
-      arr[m] = arr[m ^ lsb] + fr[Math.log2(lsb)].b;
+      arr[m] = arr[m ^ lsb] + fr[CTZ[lsb]].b;
     }
     return arr;
   });
@@ -189,9 +198,9 @@ export function solveLineage(spec) {
   const keepOpts = [];
   const splitOpts = [];
   for (let t = 0; t < F - 1; t++) {
-    keepOpts[t] = near1[t].map((mask) => bits(mask).map((j) => 1 << j));
+    keepOpts[t] = near1[t].map((mask) => BITS[mask].map((j) => 1 << j));
     splitOpts[t] = near1[t].map((mask) => {
-      const js = bits(mask);
+      const js = BITS[mask];
       const out = [];
       for (let a = 0; a < js.length; a++) {
         for (let b = a + 1; b < js.length; b++) out.push((1 << js[a]) | (1 << js[b]));
@@ -201,51 +210,34 @@ export function solveLineage(spec) {
   }
 
   /**
-   * 边界 t 的联合转移：存活母本（帧 t）与待补获漏检母本（帧 t-1）
-   * 共同在帧 t+1 上安排女儿。
-   * @returns {Map<number, Int8Array>} key = 女儿掩码*512 + 新开漏检母本掩码；
-   *   value 为按女儿序号排列的母本全局序号向量（-1 表示该女儿未被采用）。
-   *   同一 key 只保留字典序最小的母本向量。
+   * 阶段一：边界 t 的联合转移对集合。
+   * @returns {Uint32Array} 每个元素为 女儿掩码*512 + 新开漏检母本掩码。
+   *   只含「女儿互不共用、漏检不在末帧开」的可行对；同一对只出现一次。
+   *   结果只依赖 (t, live, gaps)，与漏检剩余额度无关，全程只算一次。
    */
-  const expandMemo = new Map();
-  function expand(t, live, gaps) {
+  const transMemo = new Map();
+  function transitions(t, live, gaps) {
     const key = (t << 20) | (live << 10) | gaps;
-    const cached = expandMemo.get(key);
-    if (cached) return cached;
+    const cached = transMemo.get(key);
+    if (cached !== undefined) return cached;
 
-    const nChild = sizes[t + 1];
-    const liveMoms = bits(live);
-    const gapMoms = bits(gaps);
-    // dp：转移中间状态键 -> 母本向量
-    let dp = new Map([[0, new Int8Array(nChild).fill(-1)]]);
-
-    const put = (map, k, mom) => {
-      const old = map.get(k);
-      if (old === undefined) { map.set(k, mom); return; }
-      for (let j = 0; j < nChild; j++) {
-        if (mom[j] !== old[j]) {
-          if (mom[j] < old[j]) map.set(k, mom);
-          return;
-        }
-      }
-    };
+    const liveMoms = BITS[live];
+    const gapMoms = BITS[gaps];
+    const totalTracks = gapMoms.length + liveMoms.length;
+    let dp = new Set([0]); // 状态键低 9 位为新开漏检掩码，余为女儿掩码
 
     // 1) 待补获漏检母本（帧 t-1）：恰一个跨帧女儿
-    const totalTracks = gapMoms.length + liveMoms.length;
     let processed = 0;
     for (const mi of gapMoms) {
-      const gm = gi(t - 1, mi);
       const cap = near2[t - 1][mi];
-      const rest = totalTracks - processed - 1; // 尚未处理的母本，至少再贡献 1 支
-      const ndp = new Map();
-      for (const [state, mom] of dp) {
-        const used = Math.floor(state / 512);
-        for (const b of bits(cap & ~used)) {
-          const bit = 1 << b;
-          if (popcnt(used | bit) + rest > target) continue;
-          const mom2 = mom.slice();
-          mom2[b] = gm;
-          put(ndp, (used | bit) * 512, mom2);
+      const rest = totalTracks - processed - 1; // 后续母本至少再贡献 1 支
+      const ndp = new Set();
+      for (const state of dp) {
+        const used = state >>> 9;
+        for (const b of BITS[cap & ~used]) {
+          const used2 = used | (1 << b);
+          if (PC[used2] + rest > target) continue;
+          ndp.add(used2 * 512);
         }
       }
       dp = ndp;
@@ -255,38 +247,32 @@ export function solveLineage(spec) {
     // 2) 存活母本（帧 t）：保持一女 / 分裂两女 / 本帧漏检
     const canOpen = t + 2 <= F - 1;
     for (const mi of liveMoms) {
-      const gm = gi(t, mi);
       const miBit = 1 << mi;
       const rest = totalTracks - processed - 1;
-      const ndp = new Map();
-      for (const [state, mom] of dp) {
-        const used = Math.floor(state / 512);
-        const opened = state % 512;
+      const ndp = new Set();
+      for (const state of dp) {
+        const used = state >>> 9;
+        const opened = state & 511;
 
         // 2a) 保持
         for (const bit of keepOpts[t][mi]) {
           if (used & bit) continue;
           const used2 = used | bit;
-          if (popcnt(used2) + popcnt(opened) + rest > target) continue;
-          const b = Math.log2(bit);
-          const mom2 = mom.slice();
-          mom2[b] = gm;
-          put(ndp, used2 * 512 + opened, mom2);
+          if (PC[used2] + PC[opened] + rest > target) continue;
+          ndp.add(used2 * 512 + opened);
         }
         // 2b) 分裂
         for (const pair of splitOpts[t][mi]) {
           if (used & pair) continue;
           const used2 = used | pair;
-          if (popcnt(used2) + popcnt(opened) + rest > target) continue;
-          const mom2 = mom.slice();
-          for (const b of bits(pair)) mom2[b] = gm;
-          put(ndp, used2 * 512 + opened, mom2);
+          if (PC[used2] + PC[opened] + rest > target) continue;
+          ndp.add(used2 * 512 + opened);
         }
-        // 2c) 本帧漏检（下一帧必须补获）
-        if (canOpen) {
+        // 2c) 本帧漏检（下一帧必须补获；跨帧无可达斑点则漏检无意义）
+        if (canOpen && near2[t][mi] !== 0) {
           const opened2 = opened | miBit;
-          if (popcnt(used) + popcnt(opened2) + rest <= target) {
-            put(ndp, used * 512 + opened2, mom);
+          if (PC[used] + PC[opened2] + rest <= target) {
+            ndp.add(used * 512 + opened2);
           }
         }
       }
@@ -294,18 +280,43 @@ export function solveLineage(spec) {
       processed++;
     }
 
-    expandMemo.set(key, dp);
-    return dp;
+    const arr = Uint32Array.from(dp);
+    transMemo.set(key, arr);
+    return arr;
   }
 
-  const memo = new Map();
-  const stateKey = (t, live, gaps, left) => ((((t * 256 + live) * 256 + gaps) * 8) + left) * 31;
+  // 乐观亮度上界：给定边界 t 的存活支数 co 与待补获漏检支数 cg，未来各帧
+  // 至多能安排多少支（每步存活母本至多翻倍、漏检补获单传；开漏检只会让
+  // 包络更小，故忽略），且任何时刻支数都不可能超过终帧目标 target，取该
+  // 帧最亮的 k 个斑点亮度之和作为松弛上界。
+  const topSum = frames.map((fr) => {
+    const sorted = fr.map((s) => s.b).sort((a, b) => b - a);
+    const pref = new Float64Array(fr.length + 1);
+    for (let k = 0; k < fr.length; k++) pref[k + 1] = pref[k] + sorted[k];
+    return pref;
+  });
+  const ubCache = Array.from({ length: F }, () => new Float64Array(81).fill(-1));
+  function upperBound(t, co, cg) {
+    const slot = co * 9 + cg;
+    const cached = ubCache[t][slot];
+    if (cached >= 0) return cached;
+    let sum = 0;
+    let a = co;
+    let g = cg;
+    for (let s = t + 1; s < F; s++) {
+      const k = Math.min(sizes[s], target, 2 * a + g);
+      sum += topSum[s][k];
+      a = k;
+      g = 0;
+    }
+    ubCache[t][slot] = sum;
+    return sum;
+  }
 
-  // 计数增长走廊：从 (live, gaps) 起，每步至多翻倍，漏检补获只能单传，
-  // 判断末帧存活数能否达到目标。
+  // 计数增长走廊（必要性）：从 (live, gaps) 起末帧存活数能否达到目标。
   function canReachTarget(t, live, gaps) {
-    let co = popcnt(live);
-    let cg = popcnt(gaps);
+    let co = PC[live];
+    let cg = PC[gaps];
     for (let s = 1; s <= F - 1 - t; s++) {
       co = Math.min(sizes[t + s], 2 * co + cg);
       cg = 0;
@@ -313,78 +324,71 @@ export function solveLineage(spec) {
     return co >= target;
   }
 
-  // 返回从边界 t 到末帧的最优后缀，不可行返回 null
-  function solve(t, live, gaps, left) {
-    const key = stateKey(t, live, gaps, left);
-    if (memo.has(key)) return memo.get(key);
+  // ---------- 阶段二：取值 DP（最高亮度，其次最少漏检） ----------
+  // 备忘值：null = 不可行；否则 {b: 最高后缀亮度, s: 最少后缀漏检}。
+  const vMemo = new Map();
+  const vKey = (t, live, gaps, left) => ((((t * 256 + live) * 256 + gaps) * 8) + left) * 31;
 
-    const count = popcnt(live) + popcnt(gaps);
-    if (count > target || left < 0) {
-      memo.set(key, null);
-      return null;
-    }
+  function valueDP(t, live, gaps, left) {
+    const key = vKey(t, live, gaps, left);
+    const cached = vMemo.get(key);
+    if (cached !== undefined) return cached;
+
+    const count = PC[live] + PC[gaps];
+    if (count > target || left < 0) { vMemo.set(key, null); return null; }
     if (t === F - 1) {
-      const leaf = gaps === 0 && popcnt(live) === target
-        ? { bright: 0, skips: 0, frames: [], pick: null, sub: null }
-        : null;
-      memo.set(key, leaf);
-      return leaf;
+      const v = gaps === 0 && PC[live] === target ? { b: 0, s: 0 } : null;
+      vMemo.set(key, v);
+      return v;
     }
-    if (!canReachTarget(t, live, gaps)) {
-      memo.set(key, null);
-      return null;
-    }
+    if (!canReachTarget(t, live, gaps)) { vMemo.set(key, null); return null; }
 
-    let best = null;
-    for (const [state, mom] of expand(t, live, gaps)) {
-      const used = Math.floor(state / 512);
-      const opened = state % 512;
-      const openCount = popcnt(opened);
-      if (openCount > left) continue;
-
-      const sub = solve(t + 1, used, opened, left - openCount);
-      if (!sub) continue;
-
-      const usedBits = bits(used);
-      const sigFrame = {
-        used: usedBits,
-        mothers: usedBits.map((j) => mom[j]),
-      };
-      const cand = {
-        bright: maskBright[t + 1][used] + sub.bright,
-        skips: openCount + sub.skips,
-        frames: [sigFrame, ...sub.frames],
-        pick: { t, used, mom },
-        sub,
-      };
-      if (
-        !best ||
-        cand.bright > best.bright ||
-        (cand.bright === best.bright &&
-          (cand.skips < best.skips ||
-            (cand.skips === best.skips && betterSignature(cand.frames, best.frames))))
-      ) {
-        best = cand;
+    const trans = transitions(t, live, gaps);
+    let bestB = -1;
+    let bestS = 0;
+    // 两遍枚举：先处理零新开漏检的转移，尽快以最大亮度确立现任解；
+    // 随后所有「本帧必须开漏检」的分支几乎都能被漏检前缀剪枝。
+    for (let pass = 0; pass < 2; pass++) {
+      for (const state of trans) {
+        const used = state >>> 9;
+        const opened = state & 511;
+        const openCount = PC[opened];
+        if (pass === 0 ? openCount !== 0 : openCount === 0) continue;
+        if (openCount > left) continue;
+        const h = maskBright[t + 1][used];
+        // 乐观上界低于现任亮度必败；持平时若本帧新开漏检已不少于现任
+        // 总漏检，也不可能在「亮度持平、漏检更少」上翻盘。剪枝精确。
+        if (bestB >= 0) {
+          const bound = h + upperBound(t + 1, PC[used], openCount);
+          if (bound < bestB) continue;
+          if (bound === bestB && openCount > bestS) continue;
+        }
+        const sub = valueDP(t + 1, used, opened, left - openCount);
+        if (sub === null) continue;
+        const b = h + sub.b;
+        const s = openCount + sub.s;
+        if (b > bestB || (b === bestB && s < bestS)) { bestB = b; bestS = s; }
       }
     }
-    memo.set(key, best);
-    return best;
+    const v = bestB < 0 ? null : { b: bestB, s: bestS };
+    vMemo.set(key, v);
+    return v;
   }
 
   const rootMask = 1 << startIndex;
-  const root = solve(0, rootMask, 0, maxSkip);
+  const rootV = valueDP(0, rootMask, 0, maxSkip);
 
-  if (!root) {
+  if (rootV === null) {
     // 最早断开帧间：逐步前向展开可达状态，以局部必要存活条件（计数走廊、
     // 漏检必须在补获帧有可达斑点、末帧计数恰为目标）筛选，找出首个
     // 所有后继都无法存活的帧间。
     const viable = (t, live, gaps, left) => {
       if (left < 0) return false;
-      if (popcnt(live) + popcnt(gaps) > target) return false;
-      if (t === F - 1) return gaps === 0 && popcnt(live) === target;
+      if (PC[live] + PC[gaps] > target) return false;
+      if (t === F - 1) return gaps === 0 && PC[live] === target;
       if (!canReachTarget(t, live, gaps)) return false;
       if (t >= 1) {
-        for (const mi of bits(gaps)) {
+        for (const mi of BITS[gaps]) {
           if (near2[t - 1][mi] === 0) return false;
         }
       }
@@ -393,19 +397,21 @@ export function solveLineage(spec) {
 
     let reach = new Map();
     if (viable(0, rootMask, 0, maxSkip)) {
-      reach.set(0, { live: rootMask, gaps: 0, left: maxSkip });
+      reach.set((rootMask << 10) | 0, { live: rootMask, gaps: 0, left: maxSkip });
     }
     let earliest = 0;
     for (let t = 0; t < F - 1; t++) {
       const next = new Map();
       for (const st of reach.values()) {
-        for (const state of expand(t, st.live, st.gaps).keys()) {
-          const used = Math.floor(state / 512);
-          const opened = state % 512;
-          const nleft = st.left - popcnt(opened);
+        for (const state of transitions(t, st.live, st.gaps)) {
+          const used = state >>> 9;
+          const opened = state & 511;
+          const nleft = st.left - PC[opened];
           if (!viable(t + 1, used, opened, nleft)) continue;
           const k = (used << 10) | opened;
-          if (!next.has(k)) next.set(k, { live: used, gaps: opened, left: nleft });
+          const prev = next.get(k);
+          // 同一 (live, gaps) 保留最大剩余额度：额度越大越可能存活
+          if (!prev || nleft > prev.left) next.set(k, { live: used, gaps: opened, left: nleft });
         }
       }
       if (next.size === 0) {
@@ -419,13 +425,195 @@ export function solveLineage(spec) {
     return { feasible: false, earliestBreak: { from: earliest, to: earliest + 1 } };
   }
 
-  // 沿最优链重建母女边
+  const optB = rootV.b;
+  const optS = rootV.s;
+
+  // ---------- 阶段三a：精确残量可行性（后缀能否恰好取得亮度 B、漏检 S） ----------
+  // 外层键 = (t, live, gaps, left, S)，内层 Map 为残量亮度 B → 0/1。
+  const fMemo = new Map();
+  const fHeadKey = (t, live, gaps, left, S) =>
+    (((((t * 256 + live) * 256 + gaps) * 8 + left) * 8) + S) * 37;
+
+  function feas(t, live, gaps, left, B, S) {
+    if (B < 0 || S < 0 || left < 0 || S > left) return 0;
+    const count = PC[live] + PC[gaps];
+    if (count > target) return 0;
+    if (t === F - 1) {
+      return (gaps === 0 && PC[live] === target && B === 0 && S === 0) ? 1 : 0;
+    }
+    if (!canReachTarget(t, live, gaps)) return 0;
+    if (B > upperBound(t, PC[live], PC[gaps])) return 0;
+    // 取值上界（含额度）：残量 (B,S) 不能被该状态的最优 (亮度, 漏检) 支配。
+    const v = valueDP(t, live, gaps, left);
+    if (v === null) return 0;
+    if (B > v.b) return 0;
+    if (B === v.b && S < v.s) return 0;
+
+    const hk = fHeadKey(t, live, gaps, left, S);
+    let bucket = fMemo.get(hk);
+    if (bucket !== undefined && bucket.has(B)) return bucket.get(B);
+
+    let found = 0;
+    for (const state of transitions(t, live, gaps)) {
+      const used = state >>> 9;
+      const opened = state & 511;
+      const openCount = PC[opened];
+      if (openCount > left) continue;
+      const h = maskBright[t + 1][used];
+      if (h > B) continue;
+      if (feas(t + 1, used, opened, left - openCount, B - h, S - openCount)) {
+        found = 1;
+        break;
+      }
+    }
+    if (bucket === undefined) {
+      bucket = new Map();
+      fMemo.set(hk, bucket);
+    }
+    bucket.set(B, found);
+    return found;
+  }
+
+  // ---------- 阶段三b：按裁决顺序排序单个边界的转移对 ----------
+  // 先比本帧采用斑点序号元组（由女儿掩码决定）；仅当女儿掩码相同（漏检
+  // 掩码不同）时才需要按需计算母本配对再逐女儿比母本全局序号。
+  const canonicalMemo = new Map();
+  function canonicalMoms(t, live, gaps, usedTarget, openedTarget) {
+    const key = ((((t * 256 + live) * 256 + gaps) * 512 + usedTarget) * 512) + openedTarget;
+    const cached = canonicalMemo.get(key);
+    if (cached !== undefined) return cached;
+
+    // 受限于单一 (usedTarget, openedTarget) 的小型 DP：处理顺序与阶段一
+    // 相同（漏检母本先补获，再存活母本），存活母本按 openedTarget 决定
+    // 是否本帧漏检；其余必须在 usedTarget 内保持/分裂，铺满 usedTarget。
+    // 中间状态只需「已占用女儿掩码」，同掩码保留字典序最小母本向量。
+    let dp = new Map([[0, 0]]);
+
+    for (const mi of BITS[gaps]) {
+      const gm = gi(t - 1, mi);
+      const cap = near2[t - 1][mi] & usedTarget;
+      const ndp = new Map();
+      for (const [assigned, packed] of dp) {
+        for (const b of BITS[cap & ~assigned]) {
+          const a2 = assigned | (1 << b);
+          const p2 = momSet(packed, b, gm);
+          const old = ndp.get(a2);
+          ndp.set(a2, old === undefined ? p2 : preferPacked(p2, old, a2));
+        }
+      }
+      dp = ndp;
+    }
+
+    for (const mi of BITS[live]) {
+      const gm = gi(t, mi);
+      const ndp = new Map();
+      if (openedTarget & (1 << mi)) {
+        // 该母本本帧漏检：不占女儿
+        for (const [assigned, packed] of dp) ndp.set(assigned, packed);
+      } else {
+        for (const [assigned, packed] of dp) {
+          // 保持一女
+          for (const bit of keepOpts[t][mi]) {
+            if (!(usedTarget & bit) || (assigned & bit)) continue;
+            const a2 = assigned | bit;
+            const p2 = momSet(packed, CTZ[bit], gm);
+            const old = ndp.get(a2);
+            ndp.set(a2, old === undefined ? p2 : preferPacked(p2, old, a2));
+          }
+          // 分裂两女
+          for (const pair of splitOpts[t][mi]) {
+            if ((pair & usedTarget) !== pair || (assigned & pair)) continue;
+            const a2 = assigned | pair;
+            let p2 = packed;
+            for (const b of BITS[pair]) p2 = momSet(p2, b, gm);
+            const old = ndp.get(a2);
+            ndp.set(a2, old === undefined ? p2 : preferPacked(p2, old, a2));
+          }
+        }
+      }
+      dp = ndp;
+    }
+
+    const result = dp.has(usedTarget) ? dp.get(usedTarget) : null;
+    canonicalMemo.set(key, result);
+    return result;
+  }
+
+  // 已占用掩码相同的两条母本向量择优：按女儿序号找到首个不同位置，
+  // 保留母本全局序号更小者（输入顺序稳定裁决）。
+  function preferPacked(cand, old, assignedMask) {
+    for (const j of BITS[assignedMask]) {
+      const a = momGet(cand, j);
+      const b = momGet(old, j);
+      if (a !== b) return a < b ? cand : old;
+    }
+    return old;
+  }
+
+  // 同一 (t, live, gaps) 下，按帧裁决签名升序排列转移对（仅最优路径上
+  // 的少量状态会调用）。
+  function orderedTransitions(t, live, gaps) {
+    const list = [...transitions(t, live, gaps)];
+    list.sort((sa, sb) => {
+      const ua = sa >>> 9;
+      const ub = sb >>> 9;
+      const c = compareList(BITS[ua], BITS[ub]);
+      if (c !== 0) return c;
+      // 女儿掩码相同：比较（唯一的）字典序最小母本配对
+      const ma = canonicalMoms(t, live, gaps, ua, sa & 511);
+      const mb = canonicalMoms(t, live, gaps, ub, sb & 511);
+      if (ma === null || mb === null) return 0;
+      for (const j of BITS[ua]) {
+        const a = momGet(ma, j);
+        const b = momGet(mb, j);
+        if (a !== b) return a < b ? -1 : 1;
+      }
+      return 0;
+    });
+    return list;
+  }
+
+  // ---------- 阶段三c：沿最优 (亮度, 漏检) 重建字典序最小链 ----------
+  const picks = []; // 每帧 {used, opened, moms(压缩母本向量)}
+  let rt = 0;
+  let rLive = rootMask;
+  let rGaps = 0;
+  let rLeft = maxSkip;
+  let rB = optB;
+  let rS = optS;
+  while (rt < F - 1) {
+    let chosen = null;
+    for (const state of orderedTransitions(rt, rLive, rGaps)) {
+      const used = state >>> 9;
+      const opened = state & 511;
+      const openCount = PC[opened];
+      if (openCount > rLeft) continue;
+      const h = maskBright[rt + 1][used];
+      if (h > rB || openCount > rS) continue;
+      if (feas(rt + 1, used, opened, rLeft - openCount, rB - h, rS - openCount)) {
+        chosen = { used, opened, openCount, moms: canonicalMoms(rt, rLive, rGaps, used, opened) };
+        break;
+      }
+    }
+    if (!chosen) {
+      // 理论不可达：(optB, optS) 已由取值 DP 与 feas 保证可行。
+      throw new Error('谱系重建失败（内部错误）');
+    }
+    picks.push(chosen);
+    rB -= maskBright[rt + 1][chosen.used];
+    rS -= chosen.openCount;
+    rLeft -= chosen.openCount;
+    rLive = chosen.used;
+    rGaps = chosen.opened;
+    rt++;
+  }
+
+  // 沿链重建母女边
   const edges = [];
-  let node = root;
-  while (node && node.pick) {
-    const { t, used, mom } = node.pick;
-    for (const j of bits(used)) {
-      const g = mom[j];
+  for (let t = 0; t < picks.length; t++) {
+    const { used, moms } = picks[t];
+    for (const j of BITS[used]) {
+      const g = momGet(moms, j);
       const { t: mf, i: mi } = decode(g);
       const gap = mf === t - 1 ? 2 : 1;
       edges.push({
@@ -435,7 +623,6 @@ export function solveLineage(spec) {
         dist: Math.sqrt(d2(frames[mf][mi], frames[t + 1][j])),
       });
     }
-    node = node.sub;
   }
 
   const usedPerFrame = Array.from({ length: F }, () => new Set());
@@ -448,8 +635,8 @@ export function solveLineage(spec) {
   return {
     feasible: true,
     root: gi(0, startIndex),
-    totalBrightness: frames[0][startIndex].b + root.bright,
-    skips: root.skips,
+    totalBrightness: frames[0][startIndex].b + optB,
+    skips: optS,
     survivors: target,
     edges,
     usedPerFrame: usedPerFrame.map((s) => [...s].sort((a, b) => a - b)),
